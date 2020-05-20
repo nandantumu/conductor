@@ -1,0 +1,76 @@
+#! /usr/bin/env/python3
+import logging
+import zmq
+import time
+
+from orchestra.connection import *
+from orchestra.runner import open_subprocess, kill
+
+def main(server_name='command', program='', timeout=2):
+    context = zmq.Context()
+
+    ### This is the keep-alive and status confirmation channel ###
+    requester = context.socket(zmq.REQ)
+    requester.connect("tcp://{}:5557".format(server_name))
+    logging.info("Connected to server {} with REQ protocol".format(server_name))
+
+    ### This channel informs us of the desired status of the conductor ###
+    subscriber = context.socket(zmq.SUB)
+    subscriber.connect("tcp://{}:5555".format(server_name))
+    subscriber.setsockopt_string(zmq.SUBSCRIBE, 'all')
+    logging.info("Connected to publisher at {} with SUB tcp socket.".format(server_name))
+
+    state = 'unstarted'
+    proc = None
+    name = None
+    last_beat = None
+
+    try:
+        while True:
+            while True: # This loop looks for new messages from the publisher.
+                try:
+                    sub_msg = subscriber.recv_string(zmq.DONTWAIT)
+                    if sub_msg == 'all_START' and state != 'started':
+                        proc = open_subprocess(program)
+                        state = 'started'
+                        logging.info("Process started")
+                    elif sub_msg == 'all_STOP' and state != 'stopped':
+                        if proc is not None:
+                            kill(proc)
+                            proc = None
+                            logging.info("Process stopped")
+                        state = 'stopped'
+                except zmq.Again:
+                    break
+            while True: # This loop looks for messages from our one on one connection
+                try:
+                    try: # We can either be in request state, or recieve state
+                        if name is None:
+                            requester.send_pyobj({'state':state,'proc':program}, zmq.DONTWAIT)
+                        else:
+                            requester.send_pyobj({'state':state,'proc':program,'name':name}, zmq.DONTWAIT)
+                        logging.info("Request sent on REQ socket.")
+                    except zmq.ZMQError: # Probably a socket error
+                        req_msg = requester.recv_pyobj(zmq.DONTWAIT) # We're really just looking for any response to confirm the server is alive.
+                        if name is None:
+                            # We want the name the conductor gave us
+                            name = req_msg['name']
+                        last_beat = time.time()
+                        logging.info("Request recieved.")
+                except zmq.Again:
+                    break
+            if last_beat is not None and time.time()-last_beat > timeout: # If we haven't heard from the server in 2 seconds, flip out and kill. Only active after the first time we hear from the server.
+                logging.info("Heartbeat not found, killing process.")
+                if state == 'started' and proc is not None:
+                    kill(proc)
+                    proc = None
+                    logging.info("Process killed.")
+                break
+            time.sleep(0.001) # Wait a millisecond
+    except KeyboardInterrupt:
+        if proc is not None:
+            kill(proc)
+
+if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.DEBUG)
+    main(server_name='command.local',program='tail -f /dev/null')

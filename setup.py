@@ -13,9 +13,10 @@ setup(
     license = "CC-BY-NC-SA",
     keywords = "example documentation tutorial",
     url = "https://github.com/nandantumu/conductor",
-    packages=['conductor'],
+    packages=['orchestra'],
     long_description=read('README.md'),
     classifiers=[
         "Topic :: Utilities",
     ],
+    scripts=['bin/conductor','bin/violinist'],
 )

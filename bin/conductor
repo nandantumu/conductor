@@ -1,3 +1,108 @@
 #! /usr/bin/env/python3
 
-# TODO This entire startup script
+import logging
+import zmq
+import time
+import uuid
+
+from orchestra.connection import *
+
+def main():
+    context = zmq.Context()
+
+    ### This is the keep-alive and status confirmation channel ###
+    responder = context.socket(zmq.REP)
+    responder.bind("tcp://*:5557")
+    logging.info("Opened socket with REP protocol")
+
+    ### This channel informs us of the desired status of the conductor ###
+    publisher = context.socket(zmq.PUB)
+    publisher.bind("tcp://*:5555")
+    logging.info("Opened socket with PUB protocol")
+
+    robots = dict()
+
+    broadcast_state = 'unstarted'
+    broadcast_time = None
+
+    nonresponse_timeout = 2
+    exit_flag = False
+
+    try:
+        while True:
+            # TODO Send a message if the input from the console says to.
+            if broadcast_time is None:
+                broadcast_state = 'started'
+                publisher.send_string("all_START")
+                broadcast_time = time.time()
+                logging.info("Start signal sent at {}".format(broadcast_time))
+            if time.time()-broadcast_time > 2 and not exit_flag: # Send it again after two seconds. Unless we killed for safety
+                if broadcast_state == 'started':
+                    publisher.send_string("all_START")
+                    broadcast_time = time.time()
+                    logging.info("Start signal sent at {}".format(broadcast_time))
+                elif broadcast_state == 'stopped':
+                    publisher.send_string("all_STOP")
+                    broadcast_state = time.time()
+                    logging.info("Stop signal sent at {}".format(broadcast_time))
+                logging.info("These bots are connected: {}".format([i for i in robots]))
+            while True: # This loop maintains the heartbeat for our robots
+                try:
+                    resp_msg = responder.recv_pyobj(zmq.DONTWAIT) # We're really just looking for any response to confirm the server is alive.
+                    if 'name' not in resp_msg:
+                        # This is a new client, we should give it a name
+                        resp_msg['name'] = str(uuid.uuid1())
+                        logging.info("New client with name {}".format(resp_msg['name']))
+                    if resp_msg['name'] not in robots:
+                        # We've got to add the bot to our list, and set a joined time
+                        robots[resp_msg['name']] = dict()
+                        robots[resp_msg['name']]['state'] = resp_msg['state']
+                        robots[resp_msg['name']]['proc'] = resp_msg['proc']
+                        robots[resp_msg['name']]['last_time'] = time.time()
+                        robots[resp_msg['name']]['join_time'] = time.time()
+                    else:
+                        robots[resp_msg['name']]['state'] = resp_msg['state']
+                        robots[resp_msg['name']]['proc'] = resp_msg['proc']
+                        robots[resp_msg['name']]['last_time'] = time.time()
+                    
+                    logging.info("Got message from {} at {}".format(resp_msg['name'], robots[resp_msg['name']]['last_time']))
+                    
+                    # TODO check bot to ensure state is in the broadcast state, given 2sec buffer.
+                    if robots[resp_msg['name']]['state'] != broadcast_state and \
+                        (time.time()-robots[resp_msg['name']]['last_time']>nonresponse_timeout and \
+                        time.time()-robots[resp_msg['name']]['join_time']>nonresponse_timeout):
+                        # It's been two seconds, and we haven't observed a state change. Yikes, let's terminate.
+                        logging.warn("Robot {} has been in the wrong state for too long.".format(resp_msg['name']))
+                        
+                        publisher.send_string("all_STOP")
+                        broadcast_state = 'stopped'
+                        broadcast_time = time.time()
+                        
+                        logging.info("Stop signal sent at {}".format(broadcast_time))
+                    
+                    response = {'conductor_status':'active','name':resp_msg['name']}
+                    responder.send_pyobj(response)
+                    logging.info("Response message sent.")
+                except zmq.Again:
+                    #logging.info("No requests recieved")
+                    break
+            for bot in robots:
+                if time.time()-robots[bot]['last_time']>nonresponse_timeout:
+                    # There's an unresponsive bot. Kill them all.
+                    broadcast_state = 'started'
+                    publisher.send_string("all_STOP")
+                    broadcast_time = time.time()
+                    logging.info("Stop signal sent at {}".format(broadcast_time))
+                    exit_flag=True
+                    break
+            time.sleep(0.001) # Wait a millisecond
+    except KeyboardInterrupt:
+        # TODO broadcast_state => 'all_STOP'
+        broadcast_state = 'started'
+        publisher.send_string("all_STOP")
+        broadcast_time = time.time()
+        logging.info("Gracefully shutdown.")
+
+if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.DEBUG)
+    main()
